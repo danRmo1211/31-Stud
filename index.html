@@ -1,5 +1,5 @@
 <!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>31-stud</title>
+<title>31-stud(26デッキ)</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600&family=JetBrains+Mono:wght@300;500&family=Zen+Kaku+Gothic+New:wght@400;700&display=swap">
@@ -179,7 +179,7 @@ summary{cursor:pointer;color:var(--tx);font-family:var(--lf);letter-spacing:.2em
 <canvas id="sky" aria-hidden="true"></canvas>
 <div class="table" id="table">
   <header>
-    <h1>31-stud</h1>
+    <h1>31-stud<small style="font-family:var(--body);font-size:.8rem;margin-left:8px;color:var(--mut);letter-spacing:.1em">26 DECK ♠♥</small></h1>
     <div class="meta" id="meta"></div>
   </header>
   <section class="lobby" id="lobby" hidden aria-label="モード選択">
@@ -206,7 +206,7 @@ summary{cursor:pointer;color:var(--tx);font-family:var(--lf);letter-spacing:.2em
   <details>
     <summary>RULES</summary>
     <ul>
-      
+      <li>デッキはスペードとハートだけの26枚</li>
       <li>31ぴったりが最強 32以上はバースト 両方バーストなら点数に関係なく引き分け</li>
       <li>手札のAは1か11 絵札は10</li>
       <li>手札は伏せと表の2枚から始まり 表 表 伏せの順に配られる 最大5枚</li>
@@ -221,7 +221,7 @@ summary{cursor:pointer;color:var(--tx);font-family:var(--lf);letter-spacing:.2em
   </details>
   <div class="log" id="log" aria-label="記録"></div>
 </div>
-<script>window.SITE=true</script><script src="mqtt.min.js"></script>
+<script>window.SITE=true;window.DECK_SUITS=2</script><script src="mqtt.min.js"></script>
 <script>
 
 const SUITS=['♠','♥','♦','♣'], RANKS=['','A','2','3','4','5','6','7','8','9','10','J','Q','K'];
