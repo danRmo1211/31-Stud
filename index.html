@@ -207,7 +207,7 @@ summary{cursor:pointer;color:var(--tx);font-family:var(--lf);letter-spacing:.2em
     <summary>RULES</summary>
     <ul>
       
-      <li>31ぴったりが最強 32以上はバースト 両方バーストなら小さい方の勝ち</li>
+      <li>31ぴったりが最強 32以上はバースト 両方バーストなら点数に関係なく引き分け</li>
       <li>手札のAは1か11 絵札は10</li>
       <li>手札は伏せと表の2枚から始まり 表 表 伏せの順に配られる 最大5枚</li>
       <li>3枚そろったらスタンドできる スタンドしてもベットは続く</li>
@@ -242,7 +242,8 @@ function handTotal(cs){let t=0,a=0;for(const c of cs){t+=pv(c.r);if(c.r===1)a++}
 const boardVal=c=>c.r===1?11:pv(c.r);
 const boardTotal=()=>S.board.reduce((a,c)=>a+boardVal(c),0);
 // >0 means a beats b
-function cmp(a,b){const ab=a>31,bb=b>31;if(!ab&&!bb)return a-b;if(ab&&bb)return b-a;return ab?-1:1}
+// a bust counts as BUST whatever the number: both bust is a push
+function cmp(a,b){const ab=a>31,bb=b>31;if(!ab&&!bb)return a-b;if(ab&&bb)return 0;return ab?-1:1}
 const upCards=p=>S.cards[p].filter(c=>c.up);
 function visDist(p){const t=handTotal(upCards(p));return t<=31?31-t:100+t}
 // the player not on the button acts first every street, the button always acts last
