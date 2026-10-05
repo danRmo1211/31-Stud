@@ -221,7 +221,7 @@ summary{cursor:pointer;color:var(--tx);font-family:var(--lf);letter-spacing:.2em
   </details>
   <div class="log" id="log" aria-label="記録"></div>
 </div>
-<script>window.SITE=true</script><script src="peerjs.min.js"></script>
+<script>window.SITE=true</script><script src="mqtt.min.js"></script>
 <script>
 
 const SUITS=['♠','♥','♦','♣'], RANKS=['','A','2','3','4','5','6','7','8','9','10','J','Q','K'];
@@ -594,13 +594,22 @@ function start(d){if(d&&d.S){S=d.S;S.thinking=false;if(S.btn===undefined)S.btn=Y
 if(window.SITE)showLobby();
 else window.claude?.hot?.ready?window.claude.hot.ready(start):start(window.claude?.hot?.data??{});
 /* ---------- lobby and the link between two players ---------- */
-// Both players type the same 4 digits. Whoever claims the room id first is the host: their browser deals and runs the rules,
-// the guest only sends button presses and draws what the host sends back (with the host's face-down cards blanked out).
-const ROOM_PREFIX='thirty-stud-room-';
-let peer=null,conn=null,ROLE=null,CODE=null,everJoined=false,retryT=null,guestTok=null;
-function peerOpts(){const q=new URLSearchParams(location.search),h=q.get('ph');return h?{host:h,port:+(q.get('pp')||9000),path:'/',secure:false}:{}}
+// Both players type the same 4 digits. Messages travel through a public MQTT broker over a websocket, so phones on
+// mobile data or strict wifi connect as easily as any web page (no direct device-to-device link to fail).
+// The first one in becomes the host: their browser deals and runs the rules and keeps a "host" note on the broker
+// with a heartbeat. The guest only sends button presses and draws what the host sends back (host's face-down cards blanked).
+const TOPIC='thirty-stud-x7q/';
+const BROKERS=['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt'];
+const HB=4000,LOST=12000;
+let cli=null,ROLE=null,CODE=null,myId=null,hostId=null,claimC=0,guestTok=null,lastHost=0,lastGuest=0,hbT=null,wdT=null,hostLost=false,guestLost=true;
+function brokerList(){const q=new URLSearchParams(location.search).get('mq');return q?[q]:BROKERS}
 function lobbyMsg(t,err){const m=$('lobbyMsg');m.textContent=t;m.classList.toggle('err',!!err)}
 function netbar(msg,ok){$('netbar').hidden=false;$('nbCode').textContent=CODE;$('nbMsg').textContent=msg;$('netbar').classList.toggle('off',!ok)}
+const T=k=>TOPIC+CODE+'/'+k;
+const rid=()=>Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4);
+const pub=(k,o,retain)=>{if(cli&&cli.connected)cli.publish(T(k),JSON.stringify(o),{qos:1,retain:!!retain})};
+function store(kind,k,v){try{kind.setItem(k,v)}catch(e){}}
+function load(kind,k){try{return kind.getItem(k)}catch(e){return null}}
 
 function showLobby(){
   $('table').classList.add('inlobby');$('lobby').hidden=false;
@@ -609,43 +618,79 @@ function showLobby(){
   $('code').oninput=e=>{e.target.value=e.target.value.replace(/\D/g,'').slice(0,4)};
   $('code').onkeydown=e=>{if(e.key==='Enter')$('enter').click()};
   $('enter').onclick=()=>{const c=$('code').value;if(!/^\d{4}$/.test(c)){lobbyMsg('4桁の数字を入れてください',true);return}
-    CODE=c;$('enter').disabled=true;lobbyMsg('接続中…');setMode('pvp');tryHost()};
+    CODE=c;$('enter').disabled=true;lobbyMsg('接続中…');setMode('pvp');connect(0)};
   $('nbExit').onclick=()=>{if(confirm('部屋から出ますか'))location.href=location.pathname+location.search};
 }
 function enterGame(){$('table').classList.remove('inlobby');$('lobby').hidden=true}
-function resetPeer(){try{conn&&conn.close()}catch(e){}try{peer&&peer.destroy()}catch(e){}peer=null;conn=null}
+function backToLobby(msg){
+  clearInterval(hbT);clearInterval(wdT);try{cli&&cli.end(true)}catch(e){}cli=null;ROLE=null;isGuest=false;netSend=null;S=undefined;heard=heardLive=null;
+  $('table').classList.add('inlobby');$('lobby').hidden=false;$('netbar').hidden=true;lobbyMsg(msg,true);$('enter').disabled=false}
+
+// reach the broker, falling back to the next one if it does not answer
+function connect(i){
+  const list=brokerList();
+  if(i>=list.length){lobbyMsg('サーバーにつながりませんでした 通信状態を確認してもう一度試してください',true);$('enter').disabled=false;return}
+  let done=false;
+  const c=mqtt.connect(list[i],{clientId:'ts_'+rid(),keepalive:30,reconnectPeriod:2000,connectTimeout:8000,clean:true});
+  const fail=()=>{if(done)return;done=true;try{c.end(true)}catch(e){}connect(i+1)};
+  const to=setTimeout(fail,9000);
+  c.on('error',()=>{if(!done)fail()});
+  c.on('connect',()=>{
+    if(cli===c){if(ROLE==='guest')pub('h',{a:'hello',from:myId});return} // came back after a drop
+    if(done)return;done=true;clearTimeout(to);cli=c;
+    c.on('message',onMsg);c.subscribe([T('host'),T('g'),T('h')],{qos:1},()=>decide())});
+  c.on('offline',()=>{if(cli===c&&ROLE)netbar('通信が切れました 再接続しています…',false)});
+}
+
+// who am I: a per-tab id that survives reload; a new tab borrows the last id for this room unless that id is live elsewhere
+let heard=null,heardLive=null;
+function decide(){
+  const sid=load(sessionStorage,'ts-me-'+CODE);myId=sid||load(localStorage,'ts-me-'+CODE)||rid();
+  const t0=Date.now();
+  const tick=setInterval(()=>{
+    const el=Date.now()-t0;
+    if(heardLive||(!heard&&el>1500)||el>5500){clearInterval(tick);
+      if(heardLive){if(heardLive.id===myId)myId=rid();becomeGuest(heardLive.id)}else becomeHost();
+      store(sessionStorage,'ts-me-'+CODE,myId);store(localStorage,'ts-me-'+CODE,myId)}},100);
+}
+function onMsg(topic,buf,pk){
+  let d;try{d=JSON.parse(buf.toString())}catch(e){return}if(!d||typeof d!=='object')return;
+  const k=topic.slice(topic.lastIndexOf('/')+1);
+  if(k==='host'){
+    if(!ROLE){if(pk.retain)heard=d;else heardLive=d;return}
+    if(pk.retain)return;
+    if(ROLE==='host'&&d.id!==myId){
+      // two people claimed at once: the earlier claim keeps the room
+      if(d.c<claimC||(d.c===claimC&&d.id<myId)){clearInterval(hbT);clearInterval(wdT);S=undefined;becomeGuest(d.id)}else pub('host',{id:myId,c:claimC},true)}
+    if(ROLE==='guest'){
+      if(d.id!==hostId){hostId=d.id;pub('h',{a:'hello',from:myId})}
+      lastHost=Date.now();if(hostLost){hostLost=false;netbar('対戦中',true);pub('h',{a:'hello',from:myId})}}
+    return}
+  if(k==='h'&&ROLE==='host')onGuestData(d);
+  if(k==='g'&&ROLE==='guest'&&d.to===myId)onHostData(d);
+}
 
 // host side
-function tryHost(){
-  resetPeer();peer=new Peer(ROOM_PREFIX+CODE,peerOpts());
-  peer.on('open',()=>{ROLE='host';netSend=null;
-    try{const d=JSON.parse(localStorage.getItem('ts-room-'+CODE)||'null');if(d&&Date.now()-d.t<12*3600e3&&d.S){S=d.S;guestTok=d.g||null}}catch(e){}
-    lobbyMsg(S?'部屋に戻りました 相手を待っています':'部屋を作りました 相手を待っています');
-    if(S){enterGame();markAllOld();render();netbar('相手を待っています',false)}});
-  peer.on('connection',onGuestConn);
-  peer.on('error',e=>{
-    if(e.type==='unavailable-id'){tryGuest();return}
-    if(ROLE!=='host'){lobbyMsg('つながりませんでした もう一度試してください',true);$('enter').disabled=false}
-    else netbar('通信が不安定です',false)});
-  peer.on('disconnected',()=>{if(ROLE==='host'){try{peer.reconnect()}catch(e){}}});
+function becomeHost(){
+  ROLE='host';netSend=null;claimC=Date.now();
+  try{const d=JSON.parse(load(localStorage,'ts-room-'+CODE)||'null');if(d&&Date.now()-d.t<12*3600e3&&d.S){S=d.S;guestTok=d.g||null}}catch(e){}
+  pub('host',{id:myId,c:claimC},true);hbT=setInterval(()=>pub('host',{id:myId,c:claimC},true),HB);
+  wdT=setInterval(()=>{if(guestTok&&!guestLost&&Date.now()-lastGuest>LOST){guestLost=true;netbar('相手の接続が切れました 同じ番号で戻れます',false)}},2000);
+  lobbyMsg(S?'部屋に戻りました 相手を待っています':'部屋を作りました 相手を待っています');
+  if(S){enterGame();markAllOld();render();netbar('相手を待っています',false)}
 }
-// a guest proves it is the same person coming back with a token it keeps in its own browser, so a dropped link that still
-// looks open here does not lock them out, while a third person is turned away
-function onGuestConn(c){
-  c.on('data',d=>{
-    if(c!==conn){
-      if(!d||d.a!=='hello')return;
-      const tk=String(d.tok||'');
-      if(guestTok&&tk!==guestTok&&((conn&&conn.open)||(S&&S.phase!=='over'))){c.send({t:'full'});setTimeout(()=>c.close(),800);return}
-      const old=conn;conn=c;guestTok=tk;try{old&&old.close()}catch(e){}
-      enterGame();netbar('対戦中',true);if(!S)newGame();else{netAfterRender()}
-      return}
-    onGuestData(d)});
-  c.on('close',()=>{if(conn===c){conn=null;netbar('相手の接続が切れました 同じ番号で戻れます',false)}});
-}
+// a guest proves it is the same person coming back with its id, so a dropped link does not lock them out,
+// while a third person is turned away
 const ACTS=['fold','check','call','bet','raise'];
 function onGuestData(d){
-  if(!d||typeof d!=='object'||!S)return;
+  const from=String(d.from||'');if(!from)return;
+  if(d.a==='hello'||(d.a==='ping'&&(guestLost||!guestTok))){
+    if(guestTok&&from!==guestTok&&((!guestLost)||(S&&S.phase!=='over'))){pub('g',{to:from,t:'full'});return}
+    guestTok=from;lastGuest=Date.now();guestLost=false;
+    enterGame();netbar('対戦中',true);if(!S)newGame();else netAfterRender();
+    return}
+  if(from!==guestTok||!S)return;
+  lastGuest=Date.now();
   if(d.a==='act'&&ACTS.includes(d.type)&&S.phase==='bet'&&S.toAct===1&&!S.result){act(1,d.type,Number(d.to)||0);return}
   if(d.a==='choose'){choose(!!d.stand,1);return}
   if(d.a==='next'&&S.phase==='handover'){startHand();return}
@@ -666,36 +711,23 @@ function viewFor(seat){
   if(!v.reveal)v.cards[1]=v.cards[1].map(c=>c.up?c:{r:1,s:0,up:false});
   return v;
 }
-function pushState(){if(ROLE==='host'&&conn&&conn.open)conn.send({t:'state',S:viewFor(1)})}
+function pushState(){if(ROLE==='host'&&guestTok)pub('g',{to:guestTok,t:'state',S:viewFor(1)})}
 function netAfterRender(){
   if(ROLE!=='host'||!S)return;
-  try{localStorage.setItem('ts-room-'+CODE,JSON.stringify({t:Date.now(),S,g:guestTok}))}catch(e){}
+  store(localStorage,'ts-room-'+CODE,JSON.stringify({t:Date.now(),S,g:guestTok}));
   pushState();
 }
 
 // guest side
-function tryGuest(){
-  resetPeer();peer=new Peer(peerOpts());
-  peer.on('open',()=>{
-    const c=peer.connect(ROOM_PREFIX+CODE,{reliable:true});conn=c;
-    c.on('open',()=>{ROLE='guest';isGuest=true;everJoined=true;netSend=m=>{if(c.open)c.send(m)};c.send({a:'hello',tok:myTok()});
-      lobbyMsg('部屋に入りました 配っています…');netbar('対戦中',true)});
-    c.on('data',d=>{
-      if(!d||typeof d!=='object')return;
-      if(d.t==='full'){clearTimeout(retryT);ROLE=null;isGuest=false;everJoined=false;netSend=null;S=undefined;resetPeer();
-        $('table').classList.add('inlobby');$('lobby').hidden=false;$('netbar').hidden=true;lobbyMsg('この部屋はもう2人そろっています',true);$('enter').disabled=false;return}
-      if(d.t==='state'&&d.S){const first=!S;S=d.S;S.thinking=false;if(first){enterGame();markAllOld()}render()}});
-    c.on('close',()=>{if(conn===c)guestLost()});
-  });
-  peer.on('error',e=>{
-    if(e.type==='peer-unavailable'){
-      // the host is gone: a guest who already played waits for that host, a newcomer tries to open the room itself
-      if(everJoined)guestLost();else{clearTimeout(retryT);retryT=setTimeout(tryHost,1500)}
-      return}
-    if(!everJoined){lobbyMsg('つながりませんでした もう一度試してください',true);$('enter').disabled=false}
-    else guestLost()});
+function becomeGuest(id){
+  ROLE='guest';isGuest=true;hostId=id;lastHost=Date.now();hostLost=false;
+  netSend=m=>pub('h',{...m,from:myId});
+  pub('h',{a:'hello',from:myId});lobbyMsg('部屋に入りました 配っています…');
+  hbT=setInterval(()=>pub('h',{a:'ping',from:myId}),HB);
+  wdT=setInterval(()=>{if(!hostLost&&Date.now()-lastHost>LOST){hostLost=true;netbar('相手の接続が切れました 戻るのを待っています…',false)}},2000);
 }
-function myTok(){const k='ts-guest-'+CODE;let t=null;try{t=localStorage.getItem(k)}catch(e){}
-  if(!t){t=Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(k,t)}catch(e){}}return t}
-function guestLost(){netSend=null;netbar('相手の接続が切れました 再接続しています…',false);clearTimeout(retryT);retryT=setTimeout(tryGuest,2500)}
+function onHostData(d){
+  if(d.t==='full'){backToLobby('この部屋はもう2人そろっています');return}
+  if(d.t==='state'&&d.S){const first=!S;S=d.S;S.thinking=false;if(first){enterGame();markAllOld()}if(!hostLost)netbar('対戦中',true);render()}
+}
 </script></body></html>
